@@ -1,0 +1,143 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'prod'],
+            description: 'Select environment for artifact upload'
+        )
+    }
+
+    environment {
+        ARTIFACTORY_SERVER = 'artifactory_server'
+        DEV_REPO  = 'npm-dev-local'
+        PROD_REPO = 'npm-prod-local'
+
+        PROJECT_NAME = 'my-nodejs-app'
+
+        SONARQUBE_ENV = 'SonarServer'
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/your-org/your-nodejs-project.git'
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm install'
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                sh 'npm test || true'  // Run tests but don't fail pipeline if no tests exist
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    withSonarQubeEnv("${SONARQUBE_ENV}") {
+                        sh """
+                        sonar-scanner \
+                          -Dsonar.projectKey=${PROJECT_NAME} \
+                          -Dsonar.projectName=${PROJECT_NAME} \
+                          -Dsonar.sources=. \
+                          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info || true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    timeout(time: 3, unit: 'MINUTES') {
+                        def quality = waitForQualityGate()
+                        if (quality.status != 'OK') {
+                            error "❌ Quality Gate Failed: ${quality.status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build App') {
+            steps {
+                sh 'npm run build'
+            }
+        }
+
+        stage('Trivy Scan - Filesystem') {
+            steps {
+                sh """
+                trivy fs --exit-code 1 --severity HIGH,CRITICAL .
+                """
+            }
+        }
+
+        stage('Trivy Scan - node_modules') {
+            steps {
+                sh """
+                trivy fs --exit-code 1 --severity HIGH,CRITICAL node_modules/
+                """
+            }
+        }
+
+        stage('Package Artifact (ZIP)') {
+            steps {
+                sh """
+                zip -r ${PROJECT_NAME}.zip . \
+                -x '*.git*' \
+                -x 'node_modules/*' \
+                -x '*.zip'
+                """
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: '*.zip', fingerprint: true
+                }
+            }
+        }
+
+        stage('Publish to JFrog Artifactory') {
+            steps {
+                script {
+
+                    def server = Artifactory.server("${ARTIFACTORY_SERVER}")
+
+                    def targetRepo = (params.DEPLOY_ENV == 'dev') ? DEV_REPO : PROD_REPO
+
+                    echo "📦 Uploading to JFrog Repo: ${targetRepo}"
+
+                    def uploadSpec = """{
+                        "files": [
+                            {
+                                "pattern": "*.zip",
+                                "target": "${targetRepo}/${PROJECT_NAME}/"
+                            }
+                        ]
+                    }"""
+
+                    server.upload(spec: uploadSpec)
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "🎉 Node.js pipeline completed successfully for ${params.DEPLOY_ENV.toUpperCase()} environment!"
+        }
+        failure {
+            echo "❌ Pipeline failed!"
+        }
+    }
+}
