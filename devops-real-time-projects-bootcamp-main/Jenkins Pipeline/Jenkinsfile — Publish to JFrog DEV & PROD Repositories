@@ -1,0 +1,91 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'prod'],
+            description: 'Select environment to publish artifact'
+        )
+    }
+
+    tools {
+        maven 'Maven3'
+        jdk 'JDK11'
+    }
+
+    environment {
+        ARTIFACTORY_SERVER = 'artifactory_server'   // Jenkins configured server ID
+
+        DEV_REPO  = 'libs-dev-local'                // JFrog DEV repository
+        PROD_REPO = 'libs-prod-local'               // JFrog PROD repository
+
+        PROJECT_NAME = 'my-java-app'
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/your-org/your-java-project.git'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'mvn clean compile'
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                sh 'mvn test'
+            }
+        }
+
+        stage('Package') {
+            steps {
+                sh 'mvn package -DskipTests'
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                }
+            }
+        }
+
+        stage('Publish Artifact to JFrog') {
+            steps {
+                script {
+                    def server = Artifactory.server("${ARTIFACTORY_SERVER}")
+
+                    // Select environment-based repository
+                    def targetRepo = (params.DEPLOY_ENV == 'dev') ? DEV_REPO : PROD_REPO
+
+                    echo "Deploying to JFrog Repository: ${targetRepo}"
+
+                    def uploadSpec = """{
+                        "files": [
+                            {
+                              "pattern": "target/*.jar",
+                              "target": "${targetRepo}/${PROJECT_NAME}/"
+                            }
+                        ]
+                    }"""
+
+                    server.upload(spec: uploadSpec)
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "Successfully deployed artifact to ${params.DEPLOY_ENV.toUpperCase()} environment!"
+        }
+        failure {
+            echo "Pipeline failed!"
+        }
+    }
+}
