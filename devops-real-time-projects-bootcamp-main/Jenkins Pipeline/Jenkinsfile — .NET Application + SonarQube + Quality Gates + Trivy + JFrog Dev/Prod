@@ -1,0 +1,149 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'prod'],
+            description: 'Select environment to publish artifact'
+        )
+    }
+
+    environment {
+        ARTIFACTORY_SERVER = 'artifactory_server'
+        DEV_REPO  = 'dotnet-dev-local'
+        PROD_REPO = 'dotnet-prod-local'
+        
+        PROJECT_NAME = 'my-dotnet-app'
+        SONARQUBE_ENV = 'SonarServer'
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/your-org/your-dotnet-app.git'
+            }
+        }
+
+        stage('Restore Dependencies') {
+            steps {
+                sh 'dotnet restore'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'dotnet build --configuration Release'
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                sh 'dotnet test --configuration Release --no-build'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    withSonarQubeEnv("${SONARQUBE_ENV}") {
+                        sh """
+                        dotnet-sonarscanner begin \
+                            /k:"${PROJECT_NAME}" \
+                            /n:"${PROJECT_NAME}" \
+                            /v:"1.0.0" \
+                            /d:sonar.host.url=$SONAR_HOST_URL \
+                            /d:sonar.login=$SONAR_AUTH_TOKEN
+
+                        dotnet build
+
+                        dotnet-sonarscanner end /d:sonar.login=$SONAR_AUTH_TOKEN
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    timeout(time: 3, unit: 'MINUTES') {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            error "❌ Quality Gate Failed: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Publish App') {
+            steps {
+                sh 'dotnet publish -c Release -o publish/'
+            }
+        }
+
+        stage('Trivy Scan - Filesystem') {
+            steps {
+                sh """
+                trivy fs --exit-code 1 --severity HIGH,CRITICAL .
+                """
+            }
+        }
+
+        stage('Trivy Scan - Published Output') {
+            steps {
+                sh """
+                trivy fs --exit-code 1 --severity HIGH,CRITICAL publish/
+                """
+            }
+        }
+
+        stage('Package Artifact') {
+            steps {
+                sh """
+                zip -r ${PROJECT_NAME}.zip publish/
+                """
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: '*.zip', fingerprint: true
+                }
+            }
+        }
+
+        stage('Publish to JFrog Artifactory') {
+            steps {
+                script {
+                    def server = Artifactory.server("${ARTIFACTORY_SERVER}")
+
+                    def targetRepo = (params.DEPLOY_ENV == 'dev') ? DEV_REPO : PROD_REPO
+
+                    echo "📦 Uploading artifact to ${targetRepo}"
+
+                    def uploadSpec = """{
+                        "files": [
+                            {
+                                "pattern": "*.zip",
+                                "target": "${targetRepo}/${PROJECT_NAME}/"
+                            }
+                        ]
+                    }"""
+
+                    server.upload(spec: uploadSpec)
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "🎉 .NET pipeline completed successfully for ${params.DEPLOY_ENV.toUpperCase()} environment!"
+        }
+        failure {
+            echo "❌ Pipeline failed!"
+        }
+    }
+}
